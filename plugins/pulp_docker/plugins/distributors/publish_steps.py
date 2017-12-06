@@ -51,8 +51,12 @@ class WebPublisher(publish_step.PublishStep):
         # Publish v1 content, and then publish v2 content
         self.add_child(v1_publish_steps.WebPublisher(repo, publish_conduit, config,
                                                      repo_content_unit_q=date_filter))
-        self.add_child(V2WebPublisher(repo, publish_conduit, config,
-                                      repo_content_unit_q=date_filter))
+        if 1:
+            self.add_child(V2MultiWebPublisher(repo, publish_conduit, config,
+                                               repo_content_unit_q=date_filter))
+        else:
+            self.add_child(V2WebPublisher(repo, publish_conduit, config,
+                                          repo_content_unit_q=date_filter))
 
     def create_date_range_filter(self, start_date=None, end_date=None):
         """
@@ -219,6 +223,184 @@ class PublishManifestsStep(publish_step.UnitModelPluginStep):
         return os.path.join(self.parent.get_working_dir(), 'manifests')
 
 
+class V2MultiCollectTagsStep(publish_step.UnitModelPluginStep):
+    """
+    Collect Tags.
+    """
+
+    def __init__(self):
+        super(V2MultiCollectTagsStep, self).__init__(step_type=constants.PUBLISH_STEP_COLLECT_TAGS,
+                                                     model_classes=[models.Tag])
+        self.description = _('Collecting Tags.')
+
+    def process_main(self, item):
+        """
+        Collect the v2 tags.
+
+        :param item: The tag to process
+        :type  item: pulp_docker.plugins.models.Tag
+        """
+        if item.schema_version != 2:
+            return
+        img_name, sep, tag_name = item.name.partition(':')
+        if not sep:
+            return
+        manifest_id = item.manifest_digest
+        name_to_tags = self.parent.manifest_to_imgname_to_tags.setdefault(manifest_id, {})
+        name_to_tags.setdefault(img_name, []).append((tag_name, item))
+        self.parent.imgname_to_tags.setdefault(img_name, set()).add(tag_name)
+
+
+class V2MultiPublishManifestsStep(publish_step.UnitModelPluginStep):
+    def __init__(self, repo_content_unit_q=None):
+        super(V2MultiPublishManifestsStep, self).__init__(step_type=constants.PUBLISH_STEP_PROCESS_IMAGES,
+                                                          model_classes=[models.Manifest],
+                                                          repo_content_unit_q=repo_content_unit_q)
+        self.description = _('Publishing Manifests.')
+
+    def process_main(self, item):
+        """
+        Process the v2 manifests.
+
+        :param item: The manifest to process
+        :type  item: pulp_docker.plugins.models.Tag
+        """
+        if item.schema_version != 2:
+            return
+        name_to_tags = self.parent.manifest_to_imgname_to_tags.get(item.digest)
+        if not name_to_tags:
+            # We have no image name for this manifest. We cannot publish it
+            return
+        for img_name, tags in sorted(name_to_tags.items()):
+            # This image can be fetched by digest too
+            self.parent.imgname_to_mfid.setdefault(img_name, set()).add(item.digest)
+            refs = [item.digest]
+            refs.extend(x[0] for x in tags)
+            for ref in refs:
+                dest_name = os.path.join(
+                    self.get_working_dir(),
+                    img_name,
+                    "manifests",
+                    str(item.schema_version),
+                    ref)
+
+                misc.create_symlink(item._storage_path, dest_name)
+        layer_to_mf = self.parent.layer_to_manifests
+        for layer in item.fs_layers:
+            layer_to_mf.setdefault(layer.blob_sum, set()).add(item.digest)
+        if item.config_layer:
+            layer_to_mf.setdefault(item.config_layer, set()).add(item.digest)
+
+
+class V2MultiPublishBlobsStep(publish_step.UnitModelPluginStep):
+    """
+    Publish Blobs.
+    """
+
+    def __init__(self, repo_content_unit_q=None):
+        super(V2MultiPublishBlobsStep, self).__init__(step_type=constants.PUBLISH_STEP_BLOBS,
+                                                      model_classes=[models.Blob],
+                                                      repo_content_unit_q=repo_content_unit_q)
+        self.description = _('Publishing Blobs.')
+
+    def process_main(self, item):
+        """
+        Link the item to the Blob file.
+
+        :param item: The Blob to process
+        :type  item: pulp_docker.plugins.models.Blob
+        """
+        manifest_ids = self.parent.layer_to_manifests.get(item.digest)
+        if manifest_ids is None:
+            return
+        for mf_id in manifest_ids:
+            name_to_tags = self.parent.manifest_to_imgname_to_tags[mf_id]
+            for img_name in name_to_tags:
+                dest_name = os.path.join(
+                    self.get_working_dir(),
+                    img_name,
+                    "blobs",
+                    item.digest)
+                misc.create_symlink(item._storage_path, dest_name)
+
+
+class V2MultiPublishTagsStep(publish_step.PublishStep):
+    """
+    Publish Tags.
+    """
+
+    def __init__(self):
+        super(V2MultiPublishTagsStep, self).__init__(step_type=constants.PUBLISH_STEP_BLOBS)
+        self.description = _('Publishing Tags.')
+
+    def process_main(self, item=False):
+        repo_registry_id = configuration.get_repo_registry_id(self.get_repo(), self.get_config())
+        for img_name, tags in self.parent.imgname_to_tags.items():
+            dest_name = os.path.join(
+                self.get_working_dir(),
+                img_name,
+                "tags",
+                constants.MANIFEST_LIST_TYPE)
+            repo_name = os.path.join(repo_registry_id, img_name)
+            tag_data = {
+                'name': repo_name,
+                'tags': sorted(tags),
+            }
+            misc.mkdir(os.path.dirname(dest_name))
+            with open(dest_name, 'w') as list_file:
+                list_file.write(json.dumps(tag_data))
+
+
+class V2MultiRedirectFilesStep(publish_step.PublishStep):
+    """
+    This step creates the JSON file that describes the published repository for Crane to use.
+    """
+    def __init__(self):
+        super(V2MultiRedirectFilesStep, self).__init__(step_type=constants.PUBLISH_STEP_REDIRECT_FILE)
+        self.description = _('Publishing redirect files.')
+
+    def process_main(self):
+        """
+        Publish the JSON file for Crane.
+        """
+        repo = self.get_repo()
+        config = self.get_config()
+        registry_prefix = configuration.get_repo_registry_id(repo, config)
+        global_app_publish_dir = os.path.join(
+            configuration.get_app_publish_dir(config, self.parent.docker_api_version),
+            registry_prefix)
+        self.parent.atomic_publish_step.publish_locations.append(("app", global_app_publish_dir))
+        # Compute image references: tags and manifest IDs
+        img_refs = dict((img_name, set(tags))
+                        for img_name, tags in
+                        self.parent.imgname_to_tags.items())
+        for img_name, refs in self.parent.imgname_to_mfid.items():
+            img_refs.setdefault(img_name, set()).update(refs)
+
+        redirect_url = configuration.get_redirect_url(config,
+                                                      repo,
+                                                      self.parent.docker_api_version)
+
+        # Defaults
+        redirect_tmpl = {
+            'type': 'pulp-docker-redirect', 'version': 4, 'repository': self.get_repo().id,
+            'protected': config.get('protected', False),
+            'manifest_list_data': [],
+            'manifest_list_amd64_tags': {}}
+        working_dir = self.get_working_dir()
+
+        for img_name, refs in img_refs.items():
+            app_publish_path = os.path.join("app", "%s.json" % img_name)
+            app_publish_location = os.path.join(working_dir, app_publish_path)
+            misc.mkdir(os.path.dirname(app_publish_location))
+            redirect_data = dict(redirect_tmpl)
+            redirect_data['repo-registry-id'] = os.path.join(registry_prefix, img_name)
+            redirect_data['url'] = os.path.join(redirect_url, img_name)
+            redirect_data['schema2_data'] = sorted(refs)
+            with open(app_publish_location, 'w') as app_file:
+                app_file.write(json.dumps(redirect_data))
+
+
 class PublishManifestListsStep(publish_step.UnitModelPluginStep):
     """
     Publish ManifestLists.
@@ -360,6 +542,52 @@ class RedirectFileStep(publish_step.PublishStep):
         misc.mkdir(os.path.dirname(self.app_publish_location))
         with open(self.app_publish_location, 'w') as app_file:
             app_file.write(json.dumps(rdata))
+
+
+class V2MultiWebPublisher(publish_step.PublishStep):
+    """
+    This class performs the work of publishing a v2 Docker repository.
+    """
+    def __init__(self, repo, publish_conduit, config, repo_content_unit_q=None):
+        """
+        Initialize the V2WebPublisher.
+
+        :param repo: Pulp managed Yum repository
+        :type  repo: pulp.plugins.model.Repository
+        :param publish_conduit: Conduit providing access to relative Pulp functionality
+        :type  publish_conduit: pulp.plugins.conduits.repo_publish.RepoPublishConduit
+        :param config: Pulp configuration for the distributor
+        :type  config: pulp.plugins.config.PluginCallConfiguration
+        :param repo_content_unit_q: optional Q object that will be applied to the queries performed
+                                    against RepoContentUnit model
+        :type  repo_content_unit_q: mongoengine.Q
+        """
+        super(V2MultiWebPublisher, self).__init__(
+            step_type=constants.PUBLISH_STEP_WEB_PUBLISHER, repo=repo,
+            publish_conduit=publish_conduit, config=config)
+        self.docker_api_version = 'v2'
+        self.manifest_to_imgname_to_tags = {}
+        # Needed when publishing tags and redirect files
+        self.imgname_to_tags = {}
+        # Needed when publishing redirect files
+        self.imgname_to_mfid = {}
+        # Needed when publishing blobs
+        self.layer_to_manifests = {}
+        # Will be set by PublishV2FileStep
+        self.redirect_files = None
+        self.add_child(V2MultiCollectTagsStep())
+        self.add_child(V2MultiPublishManifestsStep(repo_content_unit_q))
+        self.add_child(V2MultiPublishBlobsStep(repo_content_unit_q=repo_content_unit_q))
+        self.add_child(V2MultiPublishTagsStep())
+        self.add_child(V2MultiRedirectFilesStep())
+
+        publish_dir = configuration.get_web_publish_dir(repo, config, self.docker_api_version)
+        master_publish_dir = configuration.get_master_publish_dir(repo, config, self.docker_api_version)
+        self.atomic_publish_step = publish_step.AtomicDirectoryPublishStep(
+            self.get_working_dir(), [('', publish_dir)],
+            master_publish_dir, step_type=constants.PUBLISH_STEP_OVER_HTTP)
+        self.atomic_publish_step.description = _('Making v2 files available via web.')
+        self.add_child(self.atomic_publish_step)
 
 
 class PublishTagsForRsyncStep(RSyncFastForwardUnitPublishStep):
