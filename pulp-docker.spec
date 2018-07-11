@@ -8,7 +8,7 @@
 %global git_tag %{name}-%{version}-%{release_number}
 
 Name: pulp-docker
-Version: 3.1.0
+Version: 3.1.1
 Release: %{release_number}%{?dist}
 Summary: Support for Docker layers in the Pulp platform
 Group: Development/Languages

@@ -401,6 +401,33 @@ class V2MultiRedirectFilesStep(publish_step.PublishStep):
                 app_file.write(json.dumps(redirect_data))
 
 
+class V2MultiImageListingStep(publish_step.PublishStep):
+    """
+    This step creates the JSON file that describes the published repository for Crane to use.
+    """
+    def __init__(self):
+        super(V2MultiImageListingStep, self).__init__(step_type=constants.PUBLISH_STEP_IMAGE_LIST)
+        self.description = _('Publishing image listing')
+
+    def process_main(self):
+        repo = self.get_repo()
+        config = self.get_config()
+        registry_prefix = configuration.get_repo_registry_id(repo, config)
+        dest_name = os.path.join(self.get_working_dir(), 'image_list.json')
+        name_to_mfdata = dict()
+        for manifest_id, name_tags in sorted(self.parent.manifest_to_imgname_to_tags.items()):
+            for imgname, tags in sorted(name_tags.items()):
+                name_to_mfdata.setdefault(
+                    "%s/%s" % (registry_prefix, imgname), []).append(
+                        dict(manifest_id=manifest_id,
+                             tags=sorted(x[0] for x in tags)))
+        images = []
+        for name, mfdata in sorted(name_to_mfdata.items()):
+            images.append(dict(name=name, manifests=mfdata))
+        with open(dest_name, "w") as fobj:
+            json.dump(dict(images=images), fobj)
+
+
 class PublishManifestListsStep(publish_step.UnitModelPluginStep):
     """
     Publish ManifestLists.
@@ -580,6 +607,7 @@ class V2MultiWebPublisher(publish_step.PublishStep):
         self.add_child(V2MultiPublishBlobsStep(repo_content_unit_q=repo_content_unit_q))
         self.add_child(V2MultiPublishTagsStep())
         self.add_child(V2MultiRedirectFilesStep())
+        self.add_child(V2MultiImageListingStep())
 
         publish_dir = configuration.get_web_publish_dir(repo, config, self.docker_api_version)
         master_publish_dir = configuration.get_master_publish_dir(repo, config, self.docker_api_version)

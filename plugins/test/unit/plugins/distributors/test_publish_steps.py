@@ -58,6 +58,7 @@ class TestWebPublisher(Base):
 
 
 class TestV2MultiWebPublisher(Base):
+    @Base.patch_class("V2MultiImageListingStep")
     @Base.patch_class("publish_step.AtomicDirectoryPublishStep")
     @Base.patch_class("V2MultiRedirectFilesStep")
     @Base.patch_class("V2MultiPublishTagsStep")
@@ -66,7 +67,7 @@ class TestV2MultiWebPublisher(Base):
     @Base.patch_class("V2MultiCollectTagsStep")
     def test_children(self, _step_collect_tags, _step_pub_manifest,
                       _step_pub_blobs, _step_pub_tags, _step_pub_redir,
-                      _step_atomic_dir):
+                      _step_atomic_dir, _step_pub_image_listing):
         # Make sure the proper steps get initialized
         q = mock.MagicMock()
         step = publish_steps.V2MultiWebPublisher(
@@ -78,6 +79,7 @@ class TestV2MultiWebPublisher(Base):
                 _step_pub_blobs.return_value,
                 _step_pub_tags.return_value,
                 _step_pub_redir.return_value,
+                _step_pub_image_listing.return_value,
                 _step_atomic_dir.return_value,
             ],
             step.children)
@@ -86,6 +88,7 @@ class TestV2MultiWebPublisher(Base):
         _step_pub_blobs.assert_called_once_with(repo_content_unit_q=q)
         _step_pub_tags.assert_called_once_with()
         _step_pub_redir.assert_called_once_with()
+        _step_pub_image_listing.assert_called_once_with()
 
     def setup_repo_controller(self, controller):
         uclass_to_type_id = dict()
@@ -399,3 +402,57 @@ class TestV2MultiWebPublisher(Base):
         self.assertEquals(
             [("app", os.path.join(self.publish_dir, "v2", "app", repo_registry_id))],
             publish_locations)
+
+    @mock.patch('pulp_docker.plugins.distributors.publish_steps.configuration.server_config')
+    @mock.patch('pulp.plugins.util.publish_step.repo_controller')
+    def test_step_image_list(self, repo_controller, _server_config):
+        # redirect file has the server name in it, we need to mock it
+        _server_config.get.side_effect = dict(server='example.com').get
+
+        manifest_to_imgname_to_tags = {
+                "sha256:123": {
+                    "foo": [("latest", self.Tag_foo_123_latest),
+                            ("1.2.3", self.Tag_foo_123_123)],
+                    "bar": [("latest", self.Tag_bar_123_latest)],
+                },
+                "sha256:456": {
+                    "foo": [("latest", self.Tag_foo_456_latest),
+                            ("4.5.6", self.Tag_foo_456_456)],
+                },
+                "sha256:789": {
+                    "baz": [("latest", self.Tag_baz_789_latest)],
+                },
+            }
+        parent = mock.MagicMock(
+            manifest_to_imgname_to_tags=manifest_to_imgname_to_tags,
+            docker_api_version="v2")
+        repo_registry_id = 'onepm/onepm-rest'
+        parent.get_config.return_value = {
+            'repo-registry-id': repo_registry_id,
+            'docker_publish_directory': self.publish_dir,
+        }
+        parent.get_working_dir.return_value = self.working_dir
+        parent.get_repo.return_value = self.repo
+        step = publish_steps.V2MultiImageListingStep()
+        step.parent = parent
+
+        step.process_lifecycle()
+
+        fname = os.path.join(self.working_dir, "image_list.json")
+        self.assertEquals(
+            dict(images=[
+                dict(name="%s/%s" % (repo_registry_id, "bar"),
+                     manifests=[
+                         dict(manifest_id='sha256:123', tags=['latest'])]),
+                dict(name="%s/%s" % (repo_registry_id, "baz"),
+                     manifests=[
+                         dict(manifest_id='sha256:789', tags=['latest'])]),
+                dict(name="%s/%s" % (repo_registry_id, "foo"),
+                     manifests=[
+                         dict(manifest_id='sha256:123',
+                              tags=['1.2.3', 'latest']),
+                         dict(manifest_id='sha256:456',
+                              tags=['4.5.6', 'latest']),
+                     ]),
+            ]),
+            publish_steps.json.load(open(fname)))
