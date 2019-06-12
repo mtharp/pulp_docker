@@ -21,10 +21,13 @@ class UploadTest(unittest.TestCase):
         self.work_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.work_dir, ignore_errors=True)
 
-    @mock.patch("pulp_docker.plugins.models.Blob.save_and_import_content")
-    @mock.patch("pulp_docker.plugins.models.Manifest.save_and_import_content")
+    @mock.patch("pulp_docker.plugins.models.Blob.save")
+    @mock.patch("pulp_docker.plugins.models.Blob.import_content")
+    @mock.patch("pulp_docker.plugins.models.Manifest.save")
+    @mock.patch("pulp_docker.plugins.models.Manifest.import_content")
     @mock.patch("pulp_docker.plugins.importers.upload.repository")
-    def test_AddUnits(self, _repo_controller, _Manifest_save, _Blob_save):
+    def test_AddUnits(self, _repo_controller, _Manifest_import, _Manifest_save,
+                      _Blob_import, _Blob_save):
         # This is where we will untar the image
         step_work_dir = os.path.join(self.work_dir, "working_dir")
         os.makedirs(step_work_dir)
@@ -57,11 +60,11 @@ class UploadTest(unittest.TestCase):
             dst_blobs.append(dst)
 
         # Make sure we called save_and_import_content
-        self.assertEquals(
-            [mock.call(x) for x in dst_blobs],
-            _Blob_save.call_args_list)
-        _Manifest_save.assert_called_once_with(
-            os.path.join(step_work_dir, "012"))
+        _Blob_save.assert_called()
+        _Blob_import.assert_has_calls([mock.call(x, None) for x in dst_blobs])
+        _Manifest_save.assert_called()
+        _Manifest_import.assert_called_once_with(
+            os.path.join(step_work_dir, "012"), None)
 
         # Make sure associate_single_unit got called
         repo_obj = parent.get_repo.return_value.repo_obj

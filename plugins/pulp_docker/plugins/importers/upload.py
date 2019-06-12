@@ -21,6 +21,7 @@ import contextlib
 import functools
 import gzip
 import json
+import logging
 import os
 import stat
 import tarfile
@@ -32,8 +33,12 @@ from pulp.plugins.util.publish_step import PluginStep, GetLocalUnitsStep
 from pulp_docker.common import constants, error_codes, tarutils
 from pulp_docker.plugins import models
 from pulp_docker.plugins.importers import v1_sync
+from pulp.server.config import config
+from pulp.server.content import storage
 from pulp.server.controllers import repository
 from pulp.server.exceptions import PulpCodedValidationException
+
+_logger = logging.getLogger(__name__)
 
 
 class UploadStep(PluginStep):
@@ -317,6 +322,7 @@ class AddUnits(PluginStep):
         # Brute force, extract the tar file for now
         with contextlib.closing(tarfile.open(self.parent.file_path)) as archive:
             archive.extractall(self.get_working_dir())
+        self._parse_reference()
 
     def get_iterator(self):
         """
@@ -336,14 +342,45 @@ class AddUnits(PluginStep):
         :type      : pulp_docker.plugins.models.Blob or pulp_docker.plugins.models.Manifest
         :return:     None
         """
+        import_path = os.path.join(self.get_working_dir(), item.digest)
+        staged_path = None
         if isinstance(item, models.Blob):
-            blob_src_path = os.path.join(self.get_working_dir(), item.digest.split(':')[1] + '.tar')
-            blob_dest_path = os.path.join(self.get_working_dir(), item.digest)
-            os.rename(blob_src_path, blob_dest_path)
+            if self._staged_blobs:
+                staged_path = os.path.join(self._staged_blobs, "blobs", item.digest)
+                if not os.path.exists(staged_path):
+                    raise RuntimeError("staged blob %s is missing" % (staged_path,))
+            else:
+                blob_src_path = os.path.join(self.get_working_dir(),
+                                             item.digest.split(':')[1] + '.tar')
+                os.rename(blob_src_path, import_path)
 
         item.set_storage_path(item.digest)
         try:
-            item.save_and_import_content(os.path.join(self.get_working_dir(), item.digest))
+            item.save()
         except NotUniqueError:
+            # blob already imported into pulp
             item = item.__class__.objects.get(**item.unit_key)
+        else:
+            if staged_path:
+                # blob stored nearby and can be renamed into place
+                _logger.debug("moving staged blob from %s to %s", staged_path, item.storage_path)
+                storage.mkdir(os.path.dirname(item.storage_path))
+                os.rename(staged_path, item.storage_path)
+            else:
+                # blob unpacked from tarball
+                item.safe_import_content(import_path)
         repository.associate_single_unit(self.get_repo().repo_obj, item)
+
+    def _parse_reference(self):
+        # look for blobs that have been pre-pushed to a location on the filesystem
+        try:
+            with open(os.path.join(self.get_working_dir(), "reference.json")) as f:
+                reference = json.load(f)
+        except IOError:
+            self._staged_blobs = None
+        else:
+            ref_path = reference["ref"].split("/", 1)[1]
+            ref_path = ref_path.split(":")[0]
+            self._staged_blobs = os.path.join(config.get("server", "storage_dir"),
+                                              "docker-uploads", ref_path)
+            _logger.debug("looking for staged docker blobs at %s", self._staged_blobs)
